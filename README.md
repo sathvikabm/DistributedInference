@@ -2,126 +2,553 @@
 
 My goal from this project is to be able to do Prefill on a single GPU and pass it for Decode on another GPU -> this is to understand the memory heavy and compute heavy stages during inference.
 There are libraries already available that does this - Im trying to do this project to be able to clearly understand the process and try to make it efficient for the Decode phase and then take latency into account.
+ 
 
 
-Plan that walks from a single attention head all the way to disaggregated serving and Dynamo. 
+1) Qwen2.5-0.5B -> 2 H100 NVL 
+-> Ran time check for different prompt length(prefill) and ctx_len(decode) on the CUDA:0 
 
-## Setup assumptions
-Aat minimum: 1 GPU for Phase 0–3, 2 GPUs (single node) for Phase 4–5, and 2 nodes with NCCL or RDMA between them for Phase 6+. 
 
-Tools: `torch`, `torch.distributed`, `transformers`, `vllm`, `nvtx` / `torch.profiler`, `nsight systems` for traces.
+Findings 
 
----
+a) When GQA was used num_KV_head = 2 -> the num_attention_head did not show up in the shape
+K shape: [1, 2, 5, 64] = [batch=1, num_kv_heads=2, seq_len=5, head_dim=64]
 
-## Phase 0 — Build the forward pass 
-Goal: own every tensor that flows through one decoder layer. 
+b) Prefill time vs Decode time 
+warmup time excluded 
+Prefill is compute-bound. 128 tokens took 11.8 ms, 2048 tokens took 12.9 ms. 16x'd the work and the time barely moved. 
 
-Exercises:
-1. Implement scaled dot-product attention in raw PyTorch (no `nn.MultiheadAttention`). Inputs Q, K, V of shape `[B, H, S, D]`, output `[B, H, S, D]`.
-2. Wrap it in a single transformer block (RMSNorm → attention → residual → SwiGLU MLP → residual). Match the Llama architecture so later phases plug in cleanly.
-3. Load Llama-3.2-1B weights into hand-rolled block and verify outputs match HuggingFace within `1e-3` for one prompt. This will catch every subtle bug for free.
+```   prompt_len   prefill_ms   tokens/sec
+         128        11.82        10833
+         512        12.13        42221
+        1024        12.28        83388
+        2048        12.90       158760
+        4096        24.56       166806
+```
 
-What to internalize: the shapes. Write `[B, H, S, D]` on a sticky note.
+        
+Decode is memory-bound. 10.6 ms per token, flat across all context lengths. Doesn't matter if  context is 128 or 4096 — same speed. Why? Because the bottleneck isn't math, it's reading ~1 GB of weights from HBM every single step. The GPU's compute units are mostly waiting around. ~94 tokens/sec.
+``` ctx_len   decode_ms/tok   tokens/sec
+         128           10.57           95
+         512           10.70           93
+        1024           10.69           94
+        2048           10.58           94
+        4096           10.58           94
+```
 
----
+c) Prefill on CUDA:0, ship KV cache to CUDA:1, Decode on CUDA:1 matched Single GPU-output
 
-## Phase 1 — Attention variants
-Goal: feel why MQA/GQA exist by *measuring* KV cache size.
+The DynamicCache object isn't directly .to()-able, so we move the underlying tensors and rebuild it on the other side.
+.to() requires both tensors to live in one process's address space (one Python process owning both GPUs). Doesn't scale.
 
-Concept: in MHA have `H` query heads and `H` KV heads. In MQA have `H` Q heads and `1` KV head. In GQA have `H` Q heads and `G` KV heads where `1 < G < H` (Llama 3 uses 32 Q / 8 KV).
 
-Exercises:
-1. Take Phase 0 attention. Add a flag `kv_heads` and reshape so MHA, GQA, MQA all flow through one code path (broadcast K/V across grouped Q heads).
-2. Compute KV cache memory analytically: `2 * num_layers * seq_len * kv_heads * head_dim * dtype_bytes`. Plot it for MHA vs GQA vs MQA at `seq_len = 8k, 32k, 128k`. This is the punchline: long context is unaffordable without GQA.
-3. Replace attention with `flash_attn_func` from the `flash-attn` package. Profile both with `torch.profiler` at `seq_len = 4096`. Look at the trace: vanilla attention launches a kernel that allocates `[B, H, S, S]`; FlashAttention does not. That `S²` allocation is the entire reason FA exists.
+move_cache_to_device
+```
+from transformers import DynamicCache
 
-What to internalize: FlashAttention isn't a different math — same softmax(QK^T)V — it's a memory-access reordering (tiling + online softmax) that keeps the `S×S` matrix in SRAM. MQA/GQA reduce *KV cache*, not compute. These solve different problems.
+def move_cache_to_device(cache, device):
+    """Move a DynamicCache from one GPU to another by moving each layer's K and V tensors."""
+    new_cache = DynamicCache()
+    for i in range(len(cache)):
+        k, v = get_kv(cache, i)
+        k_new = k.to(device, non_blocking=True)
+        v_new = v.to(device, non_blocking=True)
+        new_cache.update(k_new, v_new, i)
+    torch.cuda.synchronize()
+    return new_cache
+```
 
----
 
-## Phase 2 — Prefill vs decode
-Goal: see the compute-bound / memory-bound split.
+check for NVLink
+```
+import time
 
-Concept: prefill processes the full prompt in one forward pass — that's a `[B, S_prompt, D]` tensor through every matmul, lots of arithmetic per byte loaded → **compute-bound**. Decode generates one token at a time — `[B, 1, D]` through the same weights, so load gigabytes of weights to do one token's worth of math → **memory-bandwidth-bound**.
+def bench_transfer(size_mb):
+    n_floats = (size_mb * 1024 * 1024) // 2  # fp16 = 2 bytes
+    x = torch.randn(n_floats, dtype=torch.float16, device="cuda:0")
+    
+    # Warmup
+    for _ in range(3):
+        y = x.to("cuda:1")
+    torch.cuda.synchronize()
+    
+    # Time it
+    n_runs = 20
+    start = time.perf_counter()
+    for _ in range(n_runs):
+        y = x.to("cuda:1", non_blocking=True)
+    torch.cuda.synchronize()
+    elapsed = (time.perf_counter() - start) / n_runs
+    
+    bytes_moved = n_floats * 2
+    bandwidth_gbs = bytes_moved / elapsed / 1e9
+    print(f"  {size_mb:>5} MB: {elapsed*1000:>7.3f} ms  -> {bandwidth_gbs:>6.1f} GB/s")
+    return bandwidth_gbs
 
-Exercises:
-1. Implement greedy generation with an explicit KV cache: `past_k`, `past_v` lists per layer, append on each step.
-2. Measure separately:
-   - prefill throughput: `tokens/sec` for prompt of length 512, batch 1.
-   - decode throughput: `tokens/sec` for generating 256 tokens after that prompt.
-   see prefill is maybe 10–50× faster per token. That gap is the entire motivation for disaggregation.
-3. Use `nvidia-smi dmon` or `nsys` during decode. Watch SM utilization — it'll be low. Watch HBM bandwidth — it'll be near peak. That's a memory-bound workload's fingerprint.
-4. Now try batch size 32 in decode. Throughput per token goes way up because amortize the weight-loading across more tokens. This is *why* batching matters for decode but barely matters for prefill.
+print("Transfer bandwidth GPU 0 -> GPU 1:")
+for sz in [1, 10, 100, 500, 1000]:
+    bench_transfer(sz)
+```
 
-What to internalize: prefill wants big tensor cores and low latency. Decode wants high HBM bandwidth and big batches. They benefit from *different* hardware and *different* parallelism. That's the whole reason to disaggregate.
+Output
+```
+Transfer bandwidth GPU 0 -> GPU 1:
+      1 MB:   0.020 ms  ->   52.3 GB/s
+     10 MB:   0.055 ms  ->  189.2 GB/s
+    100 MB:   0.411 ms  ->  255.4 GB/s
+    500 MB:   1.985 ms  ->  264.2 GB/s
+   1000 MB:   3.954 ms  ->  265.2 GB/s
+```
 
----
+    
+d) NCCL with two process
+```torchrun --nproc_per_node=2 --master_port=29500 disagg_nccl.py```
 
-## Phase 3 — Batching strategies
-Goal: understand why static batching is bad and what continuous batching actually does.
+Real systems have two processes (or two servers), each owning one GPU, talking via NCCL over NVLink. Same wire, different API.
+# Send each layer's K and V
+```
+send
+#PREFILL SERVER
+for i in range(len(kv)):
+   dist.send(kv.layers[i].keys.contiguous(), dst=1)
+   dist.send(kv.layers[i].values.contiguous(), dst=1)
+#Send first token
+dist.send(first_token, dst=1)
 
-Exercises:
-1. Static batching: take 8 requests of varying length, pad to longest, run together. Measure GPU idle time during decode of the short ones.
-2. Continuous (inflight) batching: maintain a "running" batch, evict finished sequences, admit new ones every step. Implement a toy version— write maybe 200 lines and finally understand vLLM's scheduler.
-3. Read the PagedAttention paper and the `vllm` `block_manager.py`. Run vLLM on the same workload and compare throughput to toy version.
+receive
+#DECODE SERVER
+meta = torch.zeros(5, dtype=torch.long, device="cuda:1")
+dist.recv(meta, src=0)
+n_layers, B, H, S, D = meta.tolist()
 
-What to internalize: KV cache fragmentation is the bottleneck of naive batching. Paging fixes that, exactly the way virtual memory fixed external fragmentation in OSes.
+kv = DynamicCache()
+for i in range(n_layers):
+   k = torch.empty((B, H, S, D), dtype=torch.float16, device="cuda:1")
+   v = torch.empty((B, H, S, D), dtype=torch.float16, device="cuda:1")
+   dist.recv(k, src=0)
+   dist.recv(v, src=0)
+   kv.update(k, v, i)
+# Receive first token
+next_token = torch.zeros((1, 1), dtype=torch.long, device="cuda:1")
+dist.recv(next_token, src=0)
 
----
+```
 
-## Phase 4 — Parallelism on a single node (multi-GPU)
-Goal: actually move tensors between GPUs and see communication cost.
+Rank 0 sent in 8.79 ms
+Rank 1 received in 4.88 ms
+For a 5-token prompt, KV cache is ~60 KB total
 
-Concepts:
-- **TP (tensor parallel)**: split weight matrices across GPUs. Column-parallel for the first matmul of a block, row-parallel for the second, all-reduce in between. For attention split *heads* across GPUs.
-- **DP (data parallel)**: full model replica per GPU, different batch shards. Cheap communication, but each GPU needs the full model. For inference, DP usually means independent replicas behind a load balancer.
-- **PP (pipeline parallel)**: split *layers* across GPUs. Microbatches flow through. Bubbles hurt latency-bound decode.
-- **EP (expert parallel)**: only relevant for MoE — experts live on different GPUs, all-to-all dispatches tokens to their chosen experts.
+60 KB at NVLink speed should take microseconds, not milliseconds. So why 8 ms? 
+Two reasons:
+First-time NCCL warmup. First send/recv after init_process_group does buffer allocation, kernel JIT, connection setup. Subsequent transfers will be ~100× faster. We'll see that in pipelining.
+24 layers × 2 tensors = 48 separate dist.send calls. Each has launch overhead. Real systems batch this — concatenate all K's into one tensor, send once. Optimization for later. 
 
-Exercises:
-1. Two GPUs, one node. Use `torch.distributed` with NCCL. Implement 2-way TP for a single attention layer: split QKV projection column-wise, split output projection row-wise, all-reduce. Verify numerical equivalence to non-TP.
-2. Extend to a full Llama block, then full model. Run prefill at TP=1 and TP=2 — measure latency and per-GPU memory. Then do the same for decode. see TP helps prefill latency and lets fit bigger models, but for small-batch decode the all-reduce eats wins.
-3. (Optional, MoE) Spin up Mixtral or DeepSeek-MoE in vLLM with `--tensor-parallel-size 2 --enable-expert-parallel` and look at the all-to-all in `nsys`. See why EP is communication-heavy.
+disagg_nccl.py
+```
+import os
+import time
+import torch
+import torch.distributed as dist
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-What to internalize: TP communication happens *every layer*. It only works when GPUs are connected by NVLink. Across nodes (slow Ethernet/IB), TP collapses — that's why cross-node parallelism is usually PP or DP or expert-parallel, not TP.
+MODEL = "Qwen/Qwen2.5-0.5B"
+PROMPT = "The capital of France is"
+MAX_NEW_TOKENS = 20
 
----
+def main():
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL, torch_dtype=torch.float16, device_map=f"cuda:{rank}"
+    )
+    model.eval()
+    
+    if rank == 0:
+        # PREFILL SERVER
+        inputs = tokenizer(PROMPT, return_tensors="pt").to("cuda:0")
+        with torch.no_grad():
+            out = model(**inputs, use_cache=True)
+        kv = out.past_key_values
+        first_token = out.logits[:, -1:].argmax(dim=-1)
+        
+        # Send shape metadata first (one tensor, fixed size)
+        k0 = kv.layers[0].keys
+        meta = torch.tensor(
+            [len(kv), k0.shape[0], k0.shape[1], k0.shape[2], k0.shape[3]],
+            dtype=torch.long, device="cuda:0",
+        )
+        dist.send(meta, dst=1)
+        
+        # Send each layer's K and V
+        t0 = time.perf_counter()
+        for i in range(len(kv)):
+            dist.send(kv.layers[i].keys.contiguous(), dst=1)
+            dist.send(kv.layers[i].values.contiguous(), dst=1)
+        torch.cuda.synchronize()
+        print(f"[rank 0] sent KV cache in {(time.perf_counter()-t0)*1000:.2f} ms")
+        
+        # Send first token
+        dist.send(first_token, dst=1)
+    
+    else:
+        # DECODE SERVER
+        meta = torch.zeros(5, dtype=torch.long, device="cuda:1")
+        dist.recv(meta, src=0)
+        n_layers, B, H, S, D = meta.tolist()
+        print(f"[rank 1] receiving cache: layers={n_layers}, shape=[{B},{H},{S},{D}]")
+        
+        # Receive into a fresh DynamicCache
+        kv = DynamicCache()
+        t0 = time.perf_counter()
+        for i in range(n_layers):
+            k = torch.empty((B, H, S, D), dtype=torch.float16, device="cuda:1")
+            v = torch.empty((B, H, S, D), dtype=torch.float16, device="cuda:1")
+            dist.recv(k, src=0)
+            dist.recv(v, src=0)
+            kv.update(k, v, i)
+        torch.cuda.synchronize()
+        print(f"[rank 1] received in {(time.perf_counter()-t0)*1000:.2f} ms")
+        
+        # Receive first token
+        next_token = torch.zeros((1, 1), dtype=torch.long, device="cuda:1")
+        dist.recv(next_token, src=0)
+        
+        # Decode loop
+        generated = [next_token]
+        with torch.no_grad():
+            for _ in range(MAX_NEW_TOKENS - 1):
+                out = model(next_token, past_key_values=kv, use_cache=True)
+                kv = out.past_key_values
+                next_token = out.logits[:, -1:].argmax(dim=-1)
+                generated.append(next_token)
+        
+        full = torch.cat(generated, dim=1)
+        print(f"[rank 1] generated: {tokenizer.decode(full[0])!r}")
+    
+    dist.destroy_process_group()
 
-## Phase 5 — Serving stack: frontend and backend
-Goal: separate the "engine" from the "server" in head.
+if __name__ == "__main__":
+    main()
+```
 
-Concepts:
-- Backend / engine: the thing that runs forward passes — vLLM, TRT-LLM, SGLang, raw PyTorch. Owns the model, the KV cache, the scheduler.
-- Frontend: HTTP/gRPC server, tokenization, request validation, streaming, OpenAI-compatible API. Owns nothing about the model.
+e) Pipeline - Plan: throw N requests at the system. Rank 0 prefills request i+1 while rank 1 decodes request i. Compare throughput vs single-GPU sequential.
+disagg_pipeline.py
+```
+import os, time, torch
+import torch.distributed as dist
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-Exercises:
-1. Write a tiny FastAPI server that wraps `transformers.generate` and exposes `/v1/chat/completions`. Stream tokens via SSE. This is the "PyTorch backend" baseline — slow but control everything.
-2. Replace the backend with `vllm.LLMEngine` (the offline class) called from FastAPI server. Same API surface, ~10× throughput. Notice what changed: continuous batching, paged KV, CUDA graphs.
-3. Now run vLLM's built-in OpenAI server (`python -m vllm.entrypoints.openai.api_server`) and benchmark with `vllm bench serve`. Compare to custom frontend → vLLM engine setup. Identical numbers. The point: frontend is interchangeable; engine is the substance.
+MODEL = "Qwen/Qwen2.5-0.5B"
+N_REQUESTS = 20
+PROMPT_LEN = 512
+DECODE_LEN = 64
 
-What to internalize: Dynamo, Triton, and vLLM's server are all *frontends + routers* — they orchestrate engines. Engines like vLLM-core or TRT-LLM are the actual GPU workhorses.
+def send_cache(kv, dst):
+    k0 = kv.layers[0].keys
+    meta = torch.tensor(
+        [len(kv), k0.shape[0], k0.shape[1], k0.shape[2], k0.shape[3]],
+        dtype=torch.long, device=k0.device,
+    )
+    dist.send(meta, dst=dst)
+    for i in range(len(kv)):
+        dist.send(kv.layers[i].keys.contiguous(), dst=dst)
+        dist.send(kv.layers[i].values.contiguous(), dst=dst)
 
----
+def recv_cache(src, device):
+    meta = torch.zeros(5, dtype=torch.long, device=device)
+    dist.recv(meta, src=src)
+    n_layers, B, H, S, D = meta.tolist()
+    kv = DynamicCache()
+    for i in range(n_layers):
+        k = torch.empty((B, H, S, D), dtype=torch.float16, device=device)
+        v = torch.empty((B, H, S, D), dtype=torch.float16, device=device)
+        dist.recv(k, src=src)
+        dist.recv(v, src=src)
+        kv.update(k, v, i)
+    return kv
 
-## Phase 6 — Disaggregated prefill/decode across two nodes
-This is the centerpiece. Goal: prefill on node A, ship the KV cache to node B, decode on B.
+def main():
+    rank = int(os.environ["RANK"])
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl")
+    
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL, torch_dtype=torch.float16, device_map=f"cuda:{rank}"
+    )
+    model.eval()
+    
+    # Warmup NCCL with a small send/recv
+    if rank == 0:
+        warmup = torch.ones(1, device="cuda:0")
+        dist.send(warmup, dst=1)
+    else:
+        warmup = torch.zeros(1, device="cuda:1")
+        dist.recv(warmup, src=0)
+    torch.cuda.synchronize()
+    
+    if rank == 0:
+        # === DISAGGREGATED RUN ===
+        prompts = [torch.randint(0, 1000, (1, PROMPT_LEN), device="cuda:0") 
+                   for _ in range(N_REQUESTS)]
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        
+        for ids in prompts:
+            with torch.no_grad():
+                out = model(ids, use_cache=True)
+            send_cache(out.past_key_values, dst=1)
+            first = out.logits[:, -1:].argmax(dim=-1)
+            dist.send(first, dst=1)
+        
+        torch.cuda.synchronize()
+        t_disagg = time.perf_counter() - t0
+        print(f"[rank 0] disaggregated: {N_REQUESTS} reqs in {t_disagg:.2f}s "
+              f"= {N_REQUESTS*DECODE_LEN/t_disagg:.0f} tok/s")
+        
+        # === SINGLE-GPU BASELINE (rank 0 does everything) ===
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for ids in prompts:
+            with torch.no_grad():
+                out = model(ids, use_cache=True)
+                kv = out.past_key_values
+                next_tok = out.logits[:, -1:].argmax(dim=-1)
+                for _ in range(DECODE_LEN - 1):
+                    out = model(next_tok, past_key_values=kv, use_cache=True)
+                    kv = out.past_key_values
+                    next_tok = out.logits[:, -1:].argmax(dim=-1)
+        torch.cuda.synchronize()
+        t_single = time.perf_counter() - t0
+        print(f"[rank 0] single-GPU:    {N_REQUESTS} reqs in {t_single:.2f}s "
+              f"= {N_REQUESTS*DECODE_LEN/t_single:.0f} tok/s")
+        
+        print(f"\nSpeedup (disagg / single): {t_single/t_disagg:.2f}x")
+    
+    else:
+        # Rank 1: receive and decode in a loop
+        for _ in range(N_REQUESTS):
+            kv = recv_cache(src=0, device="cuda:1")
+            next_tok = torch.zeros((1, 1), dtype=torch.long, device="cuda:1")
+            dist.recv(next_tok, src=0)
+            with torch.no_grad():
+                for _ in range(DECODE_LEN - 1):
+                    out = model(next_tok, past_key_values=kv, use_cache=True)
+                    kv = out.past_key_values
+                    next_tok = out.logits[:, -1:].argmax(dim=-1)
+            torch.cuda.synchronize()
+    
+    dist.destroy_process_group()
 
-Exercises:
-1. **KV transfer primitive.** On 2 nodes with NCCL set up, write a script: rank 0 generates a tensor shaped like a real KV cache (`[layers, 2, S, kv_heads, head_dim]`), rank 1 receives it via `dist.send` / `dist.recv`. Measure transfer time vs tensor size. Compare TCP vs IB. This number — KV transfer ms — is the central number in disaggregated serving.
-2. **Toy disaggregation.** On node A, run prefill only: tokenize prompt, forward pass, capture KV cache, send to node B. On node B, receive KV, run decode loop with that KV as `past_key_values`, stream tokens back to A, A returns to client. Now reimplementing Dynamo's core flow at toy scale.
-3. **Where it breaks.** Now try with a real model (say Llama-3-8B). The KV for one 8k-token prompt is hundreds of MB. Transfer time becomes meaningful. Try sending layer-by-layer as prefill computes them (overlap transfer with compute) — this is exactly what NIXL / LMCache do. Measure the savings.
-4. **Routing.** Add a simple load balancer in front: 2 prefill workers, 4 decode workers. Round-robin first. Then try "send to the decode worker that already has cached the prompt prefix" — that's KV-aware routing, the Dynamo smart-router idea, in 50 lines.
+if __name__ == "__main__":
+    main()
+```
 
-What to internalize: disaggregation buys the right to scale prefill and decode *independently* (different counts, different parallelism configs, different GPU SKUs even). The cost is KV transfer. Dynamo exists to make that cost manageable.
+```
+Output
+[rank 0] disaggregated: 20 reqs in 13.76s = 93 tok/s
+[rank 0] single-GPU:    20 reqs in 13.28s = 96 tok/s
+Speedup (disagg / single): 0.97x
+```
 
----
+Compare:
 
-## Phase 7 — Now read Dynamo
-With Phases 0–6 done, Dynamo's docs and code stop being mysterious. Recognize every piece.
+Single-GPU baseline: prefill+decode on one H100, sequential requests
+Disaggregated pipelined: prefill on rank 0, decode on rank 1, overlapped
 
-Exercises:
-1. Read the Dynamo architecture doc and map every component to something built: smart router → Phase 6 step 4; KV manager → Phase 6 step 1; engine adapter → Phase 5 step 2.
-2. Run Dynamo's reference example with vLLM as the backend. Trace one request end-to-end with logging. Identify: where does prefill happen? When does KV transfer? Where does the decode worker get scheduled?
-3. Swap the backend to TRT-LLM. Notice that the *frontend and routing* don't change — that's the abstraction win.
-4. Try a failure: kill a decode worker mid-stream. Watch what the router does. This is where production-readiness lives.
+case1:
 
+This version runs requests sequentially through the pipeline — meaning rank 0 sends a request, then waits before sending the next one (because dist.send is synchronous). It's not yet truly pipelined.
+
+disaggregation without overlap is just adding network overhead. The whole point of disagg is to do prefill and decode in parallel on different GPUs.
+
+```
+GPU 0: [prefill][send KV]------------idle for 670 ms----------[next req]
+GPU 1: --------idle--------[recv KV][decode 64 tokens]---idle---
+```
+
+case2:
+While rank 1 decodes request K, rank 0 should be prefilling request K+1. Both GPUs busy at the same time. That requires non-blocking sends (isend) so rank 0 doesn't wait for rank 1 to receive before starting the next prefill.
+
+non-blocking and overlapping prefill-i+1 with decode-i
+disagg_pipelined_nonblocking.py
+
+```
+import os, time, torch
+import torch.distributed as dist
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+
+MODEL = "Qwen/Qwen2.5-0.5B"
+N_REQUESTS = 20
+PROMPT_LEN = 512
+DECODE_LEN = 64
+
+def isend_cache(kv, dst):
+    """Non-blocking send. Returns list of work handles."""
+    k0 = kv.layers[0].keys
+    meta = torch.tensor(
+        [len(kv), k0.shape[0], k0.shape[1], k0.shape[2], k0.shape[3]],
+        dtype=torch.long, device=k0.device,
+    )
+    works = [dist.isend(meta, dst=dst)]
+    # Keep references to tensors so they don't get freed before send completes
+    tensors = [meta]
+    for i in range(len(kv)):
+        k = kv.layers[i].keys.contiguous()
+        v = kv.layers[i].values.contiguous()
+        tensors.append(k); tensors.append(v)
+        works.append(dist.isend(k, dst=dst))
+        works.append(dist.isend(v, dst=dst))
+    return works, tensors
+
+def recv_cache(src, device):
+    meta = torch.zeros(5, dtype=torch.long, device=device)
+    dist.recv(meta, src=src)
+    n_layers, B, H, S, D = meta.tolist()
+    kv = DynamicCache()
+    for i in range(n_layers):
+        k = torch.empty((B, H, S, D), dtype=torch.float16, device=device)
+        v = torch.empty((B, H, S, D), dtype=torch.float16, device=device)
+        dist.recv(k, src=src)
+        dist.recv(v, src=src)
+        kv.update(k, v, i)
+    return kv
+
+def main():
+    rank = int(os.environ["RANK"])
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl")
+    
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL, torch_dtype=torch.float16, device_map=f"cuda:{rank}"
+    )
+    model.eval()
+    
+    # Warmup NCCL
+    if rank == 0:
+        dist.send(torch.ones(1, device="cuda:0"), dst=1)
+    else:
+        dist.recv(torch.zeros(1, device="cuda:1"), src=0)
+    torch.cuda.synchronize()
+    
+    if rank == 0:
+        prompts = [torch.randint(0, 1000, (1, PROMPT_LEN), device="cuda:0") 
+                   for _ in range(N_REQUESTS)]
+        
+        # === PIPELINED DISAGGREGATED ===
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        
+        pending = []  # keep tensors alive until their send completes
+        for ids in prompts:
+            with torch.no_grad():
+                out = model(ids, use_cache=True)
+            works, tensors = isend_cache(out.past_key_values, dst=1)
+            first = out.logits[:, -1:].argmax(dim=-1).contiguous()
+            works.append(dist.isend(first, dst=1))
+            tensors.append(first)
+            pending.append((works, tensors))
+            
+            # Reap completed sends so memory can be reused
+            pending = [(w, t) for (w, t) in pending if not all(x.is_completed() for x in w)]
+        
+        # Wait for all remaining sends
+        for works, _ in pending:
+            for w in works:
+                w.wait()
+        
+        # Wait for rank 1 to finish all decodes
+        done = torch.zeros(1, device="cuda:0")
+        dist.recv(done, src=1)
+        
+        torch.cuda.synchronize()
+        t_disagg = time.perf_counter() - t0
+        print(f"[rank 0] PIPELINED disagg: {N_REQUESTS} reqs in {t_disagg:.2f}s "
+              f"= {N_REQUESTS*DECODE_LEN/t_disagg:.0f} tok/s")
+        
+        # === SINGLE-GPU BASELINE ===
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for ids in prompts:
+            with torch.no_grad():
+                out = model(ids, use_cache=True)
+                kv = out.past_key_values
+                next_tok = out.logits[:, -1:].argmax(dim=-1)
+                for _ in range(DECODE_LEN - 1):
+                    out = model(next_tok, past_key_values=kv, use_cache=True)
+                    kv = out.past_key_values
+                    next_tok = out.logits[:, -1:].argmax(dim=-1)
+        torch.cuda.synchronize()
+        t_single = time.perf_counter() - t0
+        print(f"[rank 0] single-GPU:       {N_REQUESTS} reqs in {t_single:.2f}s "
+              f"= {N_REQUESTS*DECODE_LEN/t_single:.0f} tok/s")
+        
+        print(f"\nSpeedup (single / disagg): {t_single/t_disagg:.2f}x")
+    
+    else:
+        for _ in range(N_REQUESTS):
+            kv = recv_cache(src=0, device="cuda:1")
+            next_tok = torch.zeros((1, 1), dtype=torch.long, device="cuda:1")
+            dist.recv(next_tok, src=0)
+            with torch.no_grad():
+                for _ in range(DECODE_LEN - 1):
+                    out = model(next_tok, past_key_values=kv, use_cache=True)
+                    kv = out.past_key_values
+                    next_tok = out.logits[:, -1:].argmax(dim=-1)
+            torch.cuda.synchronize()
+        
+        # Tell rank 0 we're done
+        dist.send(torch.ones(1, device="cuda:1"), dst=0)
+    
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
+```
+
+```
+Output
+[rank 0] PIPELINED disagg: 20 reqs in 14.65s = 87 tok/s
+[rank 0] single-GPU:       20 reqs in 13.46s = 95 tok/s
+Speedup (single / disagg): 0.92x
+```
+The "pipelined" version got 0.92× — worse than the non-pipelined one (0.97×). That's surprising on the surface but makes sense:
+
+The reason is that on rank 1, decode and recv happen sequentially in one Python loop. Rank 1 receives a full KV cache, then decodes 64 tokens, then receives the next cache. So rank 0's isend calls fill the NCCL buffer and block waiting for rank 1 to drain it. The "pipeline" never actually parallelizes anything.
+
+But more importantly: the workload is decode-bound by 50×. Even with perfect overlap, you can hide 12 ms of prefill inside 670 ms of decode — that saves you 12 ms out of 682. ~2% best case. You will never see a big speedup with PROMPT_LEN=512, DECODE_LEN=64 no matter how clever the code is. The math doesn't support it.
+
+
+f) Finding Crossover
+the original one - disagg_pipeline.py
+```
+# Run 1: balanced
+PROMPT_LEN = 2048
+DECODE_LEN = 32
+
+# Run 2: prefill-heavy (RAG-like)
+PROMPT_LEN = 4096
+DECODE_LEN = 16
+
+# Run 3: very prefill-heavy
+PROMPT_LEN = 8192
+DECODE_LEN = 8
+
+# Run 4: decode-heavy (your current case, for comparison)
+PROMPT_LEN = 256
+DECODE_LEN = 128
+```
+<img width="639" height="221" alt="Screenshot 2026-05-03 at 6 20 49 PM" src="https://github.com/user-attachments/assets/8c961bdf-b86e-4965-8272-3943c34319ce" />
+
+The clear winner is prompt=8192, decode=8 at 1.09×. That's the regime where prefill costs are huge and decode is cheap — RAG with a long context, generating a short answer. Disagg actually helped: 9% more throughput from the same hardware.
+The 4096/16 dip is interesting — probably noise (~5% run-to-run variance is normal here, you'd want 3 runs each to average out). Don't read too much into one number.
+The 256/128 case is exactly at parity (1.00×). At decode-heavy workloads, both GPUs do roughly the same amount of work in single-GPU mode, and disagg just adds NCCL overhead. No win.
+
+
+
+Onto next hands on -> 2GPUs for prefill and 1GPU for decode
